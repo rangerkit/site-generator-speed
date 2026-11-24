@@ -88,9 +88,15 @@ function isWsCode(c) {
 function countWords(text) {
   let count = 0;
   let inWord = false;
-  for (let i = 0; i < text.length; i++) {
-    if (isWsCode(text.charCodeAt(i))) inWord = false;
-    else if (!inWord) { inWord = true; count++; }
+  const len = text.length;
+  for (let i = 0; i < len; i++) {
+    const c = text.charCodeAt(i);
+    if (c > 32) {
+      // A word character, unless it is one of the Unicode spaces (all >= 0xa0).
+      if (c >= 0xa0 && isWsCode(c)) { inWord = false; continue; }
+      if (!inWord) { inWord = true; count++; }
+    } else if (c === 32 || (c >= 9 && c <= 13)) inWord = false;
+    else if (!inWord) { inWord = true; count++; } // control characters are \S
   }
   return count;
 }
@@ -390,9 +396,15 @@ function isContinued(line) {
   return !isWsCode(line.charCodeAt(i));
 }
 
-/** Whether `line` ends a paragraph: blank, a fence, a heading or a break. */
+/** Whether `line` ends a paragraph: blank, a fence, a heading or a break (dispatched on the first character). */
 function endsParagraph(line) {
-  return isBlankLine(line) || fenceOpen(line) !== null || headingOf(line) !== null || isHR(line);
+  if (line === '') return true;
+  const c0 = line.charCodeAt(0);
+  if (c0 === 96) return fenceOpen(line) !== null;
+  if (c0 === 35) return headingOf(line) !== null;
+  if (c0 === 45 || c0 === 42) return isHR(line);
+  if (c0 === 32 || c0 === 9) return isBlankLine(line);
+  return false;
 }
 
 const ESCAPABLE_CHARS = '\\`*_[]()#+-.!>';
@@ -433,17 +445,21 @@ const INLINE_SPECIAL = /[\\`*\[&<>"']/g;
 function renderInline(s, env) {
   const n = s.length;
   if (n === 0) return '';
-  const parts = [];
+  let out = '';
   let i = 0;
   while (i < n) {
+    INLINE_SPECIAL.lastIndex = i;
+    const m = INLINE_SPECIAL.exec(s);
+    if (m === null) { out += s.slice(i); break; }
+    if (m.index > i) { out += s.slice(i, m.index); i = m.index; }
     const c = s[i];
     if (c === '\\') {
       if (i + 1 < n && isEscapable(s[i + 1])) {
         const nx = s[i + 1];
-        parts.push(nx === '>' ? '&gt;' : nx);
+        out += nx === '>' ? '&gt;' : nx;
         i += 2;
       } else {
-        parts.push('\\');
+        out += '\\';
         i++;
       }
       continue;
@@ -451,10 +467,10 @@ function renderInline(s, env) {
     if (c === '`') {
       const j = s.indexOf('`', i + 1);
       if (j > i + 1) {
-        parts.push('<code>', escapeHtml(s.slice(i + 1, j)), '</code>');
+        out += '<code>' + escapeHtml(s.slice(i + 1, j)) + '</code>';
         i = j + 1;
       } else {
-        parts.push('`');
+        out += '`';
         i++;
       }
       continue;
@@ -463,56 +479,73 @@ function renderInline(s, env) {
       if (s[i + 1] === '*') {
         const j = findUnescaped(s, '**', i + 2);
         if (j > i + 2) {
-          parts.push('<strong>', renderInline(s.slice(i + 2, j), env), '</strong>');
+          out += '<strong>' + renderInline(s.slice(i + 2, j), env) + '</strong>';
           i = j + 2;
         } else {
-          parts.push('**');
+          out += '**';
           i += 2;
         }
         continue;
       }
       const j = findSingleStar(s, i + 1);
       if (j > i + 1) {
-        parts.push('<em>', renderInline(s.slice(i + 1, j), env), '</em>');
+        out += '<em>' + renderInline(s.slice(i + 1, j), env) + '</em>';
         i = j + 1;
       } else {
-        parts.push('*');
+        out += '*';
         i++;
       }
       continue;
     }
     if (c === '[') {
       const k = findUnescaped(s, ']', i + 1);
-      const m = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
-      const target = m === -1 ? '' : s.slice(k + 2, m);
+      const mm = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
+      const target = mm === -1 ? '' : s.slice(k + 2, mm);
       if (target !== '' && !WS_ANY.test(target)) {
-        parts.push('<a href="', escapeHtml(env.link(target)), '">', renderInline(s.slice(i + 1, k), env), '</a>');
-        i = m + 1;
+        out += '<a href="' + escapeHtml(env.link(target)) + '">' + renderInline(s.slice(i + 1, k), env) + '</a>';
+        i = mm + 1;
         continue;
       }
-      parts.push('[');
+      out += '[';
       i++;
       continue;
     }
-    if (c === '&' || c === '<' || c === '>' || c === '"' || c === "'") {
-      parts.push(ESC_MAP[c]);
-      i++;
-      continue;
-    }
-    // A plain run: everything up to the next special character is written as-is.
-    INLINE_SPECIAL.lastIndex = i;
-    const m = INLINE_SPECIAL.exec(s);
-    const end = m === null ? n : m.index;
-    parts.push(s.slice(i, end));
-    i = end;
+    // One of & < > " ' — written escaped.
+    out += ESC_MAP[c];
+    i++;
   }
-  return parts.join('');
+  return out;
+}
+
+/** A list block starting at line `i` (its first item already read): renders it, returns the next line index. */
+function renderList(lines, i, ordered, start, firstItem, env, parts) {
+  const n = lines.length;
+  const items = [[trimLine(firstItem)]];
+  i++;
+  while (i < n) {
+    const l = lines[i];
+    let itemText = null;
+    if (ordered) {
+      const o = orderedOf(l);
+      if (o !== null) itemText = o.text;
+    } else itemText = bulletOf(l);
+    if (itemText !== null) { items.push([trimLine(itemText)]); i++; }
+    else if (isContinued(l)) { items[items.length - 1].push(trimLine(l)); i++; }
+    else break;
+  }
+  const tag = ordered ? 'ol' : 'ul';
+  const open = ordered && start !== 1 ? `<ol start="${start}">` : `<${tag}>`;
+  let s = `${open}\n`;
+  for (const item of items) s += `<li>${renderInline(item.join('\n'), env)}</li>\n`;
+  parts.push(`${s}</${tag}>\n`);
+  return i;
 }
 
 /**
  * `src` rendered in one pass over its lines: its HTML (a "\n" after every
  * block), its table of contents (every level 2 and 3 heading) and its excerpt
- * (the first paragraph's inline HTML, or "").
+ * (the first paragraph's inline HTML, or ""). Block kinds are dispatched on
+ * the line's first character, which decides every kind uniquely.
  */
 function renderMarkdown(src, env, slugCached) {
   const lines = src.split('\n');
@@ -525,31 +558,33 @@ function renderMarkdown(src, env, slugCached) {
   let i = 0;
   while (i < n) {
     const line = lines[i];
-    if (isBlankLine(line)) { i++; continue; }
-    const lang = fenceOpen(line);
-    if (lang !== null) {
-      i++;
-      const bodyParts = [];
-      while (i < n && !fenceClose(lines[i])) {
-        bodyParts.push(escapeHtml(lines[i]), '\n');
+    if (line === '') { i++; continue; }
+    const c0 = line.charCodeAt(0);
+    if (c0 === 96) {
+      const lang = fenceOpen(line);
+      if (lang !== null) {
         i++;
+        const bodyParts = [];
+        while (i < n && !fenceClose(lines[i])) {
+          bodyParts.push(escapeHtml(lines[i]), '\n');
+          i++;
+        }
+        i++;
+        const cls = lang === '' ? '' : ` class="language-${lang}"`;
+        parts.push(`<pre><code${cls}>${bodyParts.join('')}</code></pre>\n`);
+        continue;
       }
-      i++;
-      const cls = lang === '' ? '' : ` class="language-${lang}"`;
-      parts.push(`<pre><code${cls}>${bodyParts.join('')}</code></pre>\n`);
-      continue;
-    }
-    const h = headingOf(line);
-    if (h !== null) {
-      const id = uniqueSlug(slugCached(h.text), ids);
-      const html = renderInline(h.text, env);
-      parts.push(`<h${h.depth} id="${id}">${html}</h${h.depth}>\n`);
-      if (h.depth === 2 || h.depth === 3) toc.push({ level: h.depth, id, html });
-      i++;
-      continue;
-    }
-    if (isHR(line)) { parts.push('<hr>\n'); i++; continue; }
-    if (line.charCodeAt(0) === 62) {
+    } else if (c0 === 35) {
+      const h = headingOf(line);
+      if (h !== null) {
+        const id = uniqueSlug(slugCached(h.text), ids);
+        const html = renderInline(h.text, env);
+        parts.push(`<h${h.depth} id="${id}">${html}</h${h.depth}>\n`);
+        if (h.depth === 2 || h.depth === 3) toc.push({ level: h.depth, id, html });
+        i++;
+        continue;
+      }
+    } else if (c0 === 62) {
       const q = [];
       while (i < n && lines[i].charCodeAt(0) === 62) {
         let l = lines[i].slice(1);
@@ -562,41 +597,25 @@ function renderMarkdown(src, env, slugCached) {
         ? '<blockquote>\n</blockquote>\n'
         : `<blockquote>\n<p>${renderInline(q.join('\n'), env)}</p>\n</blockquote>\n`);
       continue;
-    }
-    let ordered = false;
-    let start = 1;
-    let firstItem = null;
-    const b = bulletOf(line);
-    if (b !== null) firstItem = b;
-    else {
+    } else if (c0 === 45 || c0 === 42) {
+      if (isHR(line)) { parts.push('<hr>\n'); i++; continue; }
+      const b = bulletOf(line);
+      if (b !== null) { i = renderList(lines, i, false, 1, b, env, parts); continue; }
+    } else if (c0 >= 48 && c0 <= 57) {
       const o = orderedOf(line);
-      if (o !== null) { ordered = true; start = o.start; firstItem = o.text; }
-    }
-    if (firstItem !== null) {
-      const items = [[trimLine(firstItem)]];
-      i++;
-      while (i < n) {
-        const l = lines[i];
-        let itemText = null;
-        if (ordered) {
-          const o = orderedOf(l);
-          if (o !== null) itemText = o.text;
-        } else itemText = bulletOf(l);
-        if (itemText !== null) { items.push([trimLine(itemText)]); i++; }
-        else if (isContinued(l)) { items[items.length - 1].push(trimLine(l)); i++; }
-        else break;
-      }
-      const tag = ordered ? 'ol' : 'ul';
-      const open = ordered && start !== 1 ? `<ol start="${start}">` : `<${tag}>`;
-      let s = `${open}\n`;
-      for (const item of items) s += `<li>${renderInline(item.join('\n'), env)}</li>\n`;
-      parts.push(`${s}</${tag}>\n`);
-      continue;
-    }
-    const body = [trimLine(line)];
+      if (o !== null) { i = renderList(lines, i, true, o.start, o.text, env, parts); continue; }
+    } else if ((c0 === 32 || c0 === 9) && isBlankLine(line)) { i++; continue; }
+    const first = trimLine(line);
     i++;
-    while (i < n && !endsParagraph(lines[i])) { body.push(trimLine(lines[i])); i++; }
-    const html = renderInline(body.join('\n'), env);
+    let html;
+    if (i >= n || endsParagraph(lines[i])) {
+      html = renderInline(first, env);
+    } else {
+      const body = [first, trimLine(lines[i])];
+      i++;
+      while (i < n && !endsParagraph(lines[i])) { body.push(trimLine(lines[i])); i++; }
+      html = renderInline(body.join('\n'), env);
+    }
     if (!hasExcerpt) { excerpt = html; hasExcerpt = true; }
     parts.push(`<p>${html}</p>\n`);
   }
@@ -1052,26 +1071,32 @@ export function run(input) {
     date: s.data.date ?? '',
     date_long: s.data.date === undefined ? '' : longDateCached(s.data.date),
   });
-  const cardOf = (s) => ({
-    title: s.data.title,
-    url: s.url,
-    date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longDateCached(s.data.date),
-    summary: s.data.summary ?? '',
-    excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(countWords(s.body) / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
-  });
-  const pageOf = (s) => {
-    const card = cardOf(s);
-    card.slug = s.slug;
-    card.content = s.html;
-    card.toc = s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html }));
-    card.newer = linkOf(s.newer ?? null);
-    card.older = linkOf(s.older ?? null);
-    card.is_post = s.post;
-    return card;
+  const cardBase = (s) => {
+    let b = s._card;
+    if (b === undefined) {
+      b = {
+        title: s.data.title,
+        url: s.url,
+        date: s.data.date ?? '',
+        date_long: s.data.date === undefined ? '' : longDateCached(s.data.date),
+        summary: s.data.summary ?? '',
+        excerpt: s.excerpt,
+        reading_minutes: Math.max(1, Math.ceil(countWords(s.body) / 200)),
+        tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+      };
+      s._card = b;
+    }
+    return b;
   };
+  const cardOf = (s) => Object.assign({}, cardBase(s));
+  const pageOf = (s) => Object.assign({}, cardBase(s), {
+    slug: s.slug,
+    content: s.html,
+    toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+    newer: linkOf(s.newer ?? null),
+    older: linkOf(s.older ?? null),
+    is_post: s.post,
+  });
 
   const output = {};
   const cards = new Map();
